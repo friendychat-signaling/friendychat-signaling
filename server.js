@@ -1,85 +1,243 @@
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
-const cors = require("cors");
+'use strict';
+
+const express = require('express');
+const http = require('http');
+const cors = require('cors');
+const { Server } = require('socket.io');
 
 const app = express();
-
-app.use(cors());
-app.use(express.json());
-
 const server = http.createServer(app);
+
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST']
+}));
+
+app.use(express.json());
 
 const io = new Server(server, {
     cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
-    }
+        origin: '*',
+        methods: ['GET', 'POST']
+    },
+    transports: ['websocket', 'polling']
 });
+
+/*
+|--------------------------------------------------------------------------
+| Utilisateurs connectés
+|--------------------------------------------------------------------------
+|
+| userId => socketId
+|
+*/
 
 const utilisateurs = new Map();
 
-io.on("connection", (socket) => {
+function obtenirSocketUtilisateur(userId) {
+    return utilisateurs.get(String(userId)) || null;
+}
 
-    console.log("Utilisateur connecté :", socket.id);
+io.on('connection', function (socket) {
+    console.log('Connexion Socket.IO :', socket.id);
 
-    socket.on("register", (userId) => {
-        utilisateurs.set(userId, socket.id);
-        console.log("Utilisateur enregistré :", userId);
-    });
+    /*
+    |--------------------------------------------------------------------------
+    | Enregistrer l’utilisateur connecté
+    |--------------------------------------------------------------------------
+    */
 
-    socket.on("call-user", (data) => {
-        const destinataire = utilisateurs.get(data.to);
+    socket.on('register', function (userId) {
+        const id = String(userId || '').trim();
 
-        if (destinataire) {
-            io.to(destinataire).emit("incoming-call", data);
+        if (!id) {
+            return;
         }
+
+        utilisateurs.set(id, socket.id);
+        socket.data.userId = id;
+
+        console.log(
+            'Utilisateur enregistré :',
+            id,
+            socket.id
+        );
+
+        socket.emit('registered', {
+            success: true,
+            userId: id
+        });
     });
 
-    socket.on("answer-call", (data) => {
-        const destinataire = utilisateurs.get(data.to);
+    /*
+    |--------------------------------------------------------------------------
+    | Appel entrant
+    |--------------------------------------------------------------------------
+    */
 
-        if (destinataire) {
-            io.to(destinataire).emit("call-answered", data);
+    socket.on('call-user', function (data) {
+        const destinataireId = String(data?.to || '');
+        const socketDestinataire =
+            obtenirSocketUtilisateur(destinataireId);
+
+        console.log(
+            'Appel de',
+            data?.from,
+            'vers',
+            destinataireId,
+            'appel',
+            data?.callId
+        );
+
+        if (!socketDestinataire) {
+            socket.emit('user-unavailable', {
+                to: destinataireId,
+                callId: data?.callId || 0,
+                message: 'Le contact n’est pas connecté.'
+            });
+
+            return;
         }
-    });
 
-    socket.on("ice-candidate", (data) => {
-        const destinataire = utilisateurs.get(data.to);
-
-        if (destinataire) {
-            io.to(destinataire).emit("ice-candidate", data);
-        }
-    });
-
-    socket.on("end-call", (data) => {
-        const destinataire = utilisateurs.get(data.to);
-
-        if (destinataire) {
-            io.to(destinataire).emit("call-ended", data);
-        }
-    });
-
-    socket.on("disconnect", () => {
-
-        console.log("Utilisateur déconnecté :", socket.id);
-
-        for (const [userId, socketId] of utilisateurs.entries()) {
-            if (socketId === socket.id) {
-                utilisateurs.delete(userId);
-                break;
+        io.to(socketDestinataire).emit(
+            'incoming-call',
+            {
+                from: String(data?.from || ''),
+                to: destinataireId,
+                type: data?.type === 'video'
+                    ? 'video'
+                    : 'audio',
+                callId: Number(data?.callId || 0),
+                offer: data?.offer || null
             }
-        }
+        );
     });
 
+    /*
+    |--------------------------------------------------------------------------
+    | Appel accepté
+    |--------------------------------------------------------------------------
+    */
+
+    socket.on('answer-call', function (data) {
+        const destinataireId = String(data?.to || '');
+        const socketDestinataire =
+            obtenirSocketUtilisateur(destinataireId);
+
+        if (!socketDestinataire) {
+            return;
+        }
+
+        io.to(socketDestinataire).emit(
+            'call-answered',
+            {
+                from: String(data?.from || ''),
+                to: destinataireId,
+                callId: Number(data?.callId || 0),
+                answer: data?.answer || null
+            }
+        );
+    });
+
+    /*
+    |--------------------------------------------------------------------------
+    | Candidats ICE WebRTC
+    |--------------------------------------------------------------------------
+    */
+
+    socket.on('ice-candidate', function (data) {
+        const destinataireId = String(data?.to || '');
+        const socketDestinataire =
+            obtenirSocketUtilisateur(destinataireId);
+
+        if (!socketDestinataire) {
+            return;
+        }
+
+        io.to(socketDestinataire).emit(
+            'ice-candidate',
+            {
+                from: String(data?.from || ''),
+                to: destinataireId,
+                callId: Number(data?.callId || 0),
+                candidate: data?.candidate || null
+            }
+        );
+    });
+
+    /*
+    |--------------------------------------------------------------------------
+    | Appel terminé ou refusé
+    |--------------------------------------------------------------------------
+    */
+
+    socket.on('end-call', function (data) {
+        const destinataireId = String(data?.to || '');
+        const socketDestinataire =
+            obtenirSocketUtilisateur(destinataireId);
+
+        if (!socketDestinataire) {
+            return;
+        }
+
+        io.to(socketDestinataire).emit(
+            'call-ended',
+            {
+                from: String(data?.from || ''),
+                to: destinataireId,
+                callId: Number(data?.callId || 0),
+                status: data?.status || 'termine'
+            }
+        );
+    });
+
+    /*
+    |--------------------------------------------------------------------------
+    | Déconnexion
+    |--------------------------------------------------------------------------
+    */
+
+    socket.on('disconnect', function () {
+        const userId = socket.data.userId;
+
+        if (
+            userId &&
+            utilisateurs.get(userId) === socket.id
+        ) {
+            utilisateurs.delete(userId);
+        }
+
+        console.log(
+            'Socket déconnecté :',
+            socket.id
+        );
+    });
 });
 
-app.get("/", (req, res) => {
-    res.send("FriendyChat Signaling Server fonctionne.");
+/*
+|--------------------------------------------------------------------------
+| Page de test
+|--------------------------------------------------------------------------
+*/
+
+app.get('/', function (req, res) {
+    res.send(
+        'Le serveur de signalisation FriendyChat fonctionne.'
+    );
+});
+
+app.get('/status', function (req, res) {
+    res.json({
+        success: true,
+        utilisateurs_connectes: utilisateurs.size
+    });
 });
 
 const PORT = process.env.PORT || 3000;
 
-server.listen(PORT, () => {
-    console.log("Serveur lancé sur le port", PORT);
+server.listen(PORT, '0.0.0.0', function () {
+    console.log(
+        'Serveur FriendyChat lancé sur le port',
+        PORT
+    );
 });
